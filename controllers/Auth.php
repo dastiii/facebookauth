@@ -31,11 +31,21 @@
 namespace Modules\Facebookauth\Controllers;
 
 use Modules\Facebookauth\Libs\FacebookAuth;
+use Modules\Facebookauth\Mappers\User;
 
 class Auth extends \Ilch\Controller\Frontend
 {
     public function indexAction()
     {
+        if ((new User())->hasLink()) {
+            $this->addMessage('facebookauth.alreadyLinked');
+            $this->redirect([
+                'module' => 'user',
+                'controller' => 'panel',
+                'action' => 'providers',
+            ]);
+        }
+
         $auth = new FacebookAuth();
 
         $auth->setCallbackUrl($this->getLayout()->getUrl([
@@ -46,11 +56,13 @@ class Auth extends \Ilch\Controller\Frontend
 
         $auth->setPermissions(['public_profile', 'email']);
 
-        $auth->redirect('https://www.facebook.com/dialog/oauth');
+        $this->redirect($auth->redirectUrl('https://www.facebook.com/dialog/oauth'));
     }
 
     public function callbackAction()
     {
+        $user = new User();
+
         $auth = new FacebookAuth();
 
         $auth->setCallbackUrl($this->getLayout()->getUrl([
@@ -59,12 +71,35 @@ class Auth extends \Ilch\Controller\Frontend
             'action' => 'callback',
         ]));
 
-        $auth->evaluateResponse($this->getRequest()->getQuery());
+        $auth->performAuthentication($this->getRequest()->getQuery());
 
         if ($auth->hasError()) {
             throw new \Exception('There was an error: '.$auth->getErrorCode());
         }
 
-        dumpVar($this->getRequest()->getQuery());
+        if (loggedIn() && $user->link($auth->getUser())) {
+            //TODO: Save access_token
+            $this->addMessage('facebookauth.accountsLinkedSuccessfully');
+            $this->redirect([
+                'module' => 'user',
+                'controller' => 'panel',
+                'action' => 'providers',
+            ]);
+        }
+
+        $authUserId = $user->get($auth->getUser());
+
+        if (!is_null($authUserId) && $authUserId !== false) {
+            $_SESSION['user_id'] = $authUserId;
+
+            $this->addMessage('facebookauth.welcome');
+            $this->redirect([
+                'module' => 'user',
+                'controller' => 'panel',
+                'action' => 'index',
+            ]);
+        }
+
+        //TODO: User registration
     }
 }

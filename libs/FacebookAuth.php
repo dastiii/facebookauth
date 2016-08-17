@@ -30,6 +30,8 @@
 
 namespace Modules\Facebookauth\Libs;
 
+use stdClass;
+
 class FacebookAuth
 {
     /**
@@ -46,6 +48,11 @@ class FacebookAuth
      * Status if the csrf token is invalid.
      */
     const ERROR_INVALID_CSRF_TOKEN = 'error.invalidCsrfToken';
+
+    /**
+     * Status if the auth fails with an oauth exception.
+     */
+    const ERROR_OAUTH_EXCEPTION = 'error.oauthException';
 
     /**
      * The url facebook redirects to upon authorization of your app.
@@ -90,6 +97,20 @@ class FacebookAuth
     protected $graphApiVersion;
 
     /**
+     * Access token to query the user.
+     *
+     * @var string
+     */
+    protected $userAccessToken = null;
+
+    /**
+     * Facebook user object.
+     *
+     * @var stdClass
+     */
+    protected $user;
+
+    /**
      * Permissions to request from the person using your app.
      *
      * @var array
@@ -105,11 +126,11 @@ class FacebookAuth
     {
         // TODO: Get appId and appSecret (and graphVersion?) from database
         $this->setAppId('1151382428241836');
-        $this->setAppSecret('1caf7e02341afbb21c201770895fa43c');
+        $this->setAppSecret('3fd993477be66d6e2ca02ee461f2b5e7');
         $this->setGraphApiVersion('v2.7');
     }
 
-    public function redirect($url)
+    public function redirectUrl($url)
     {
         $this->generateCsrfToken();
 
@@ -128,8 +149,7 @@ class FacebookAuth
             'redirect_uri' => $this->getCallbackUrl(),
         ];
 
-        header('Location: '.$this->buildUrl($url, $params));
-        exit;
+        return $this->buildUrl($url, $params);
     }
 
     /**
@@ -141,21 +161,27 @@ class FacebookAuth
     {
         $token = bin2hex(openssl_random_pseudo_bytes(32));
 
-        $_SESSION['facebookauth_csrf']['token'] = $token;
-        $_SESSION['facebookauth_csrf']['expires'] = strtotime('+5 minutes');
+        array_dot_set($_SESSION, 'facebookauth_csrf.token', $token);
+        array_dot_set($_SESSION, 'facebookauth_csrf.expires', strtotime('+5 minutes'));
 
         return $this->setCsrfToken($token);
     }
 
-    public function evaluateResponse($queryParams)
+    public function performAuthentication($queryParams)
     {
         $this->checkCsrfToken(array_dot($queryParams, 'state'));
+
+        if ($this->hasError()) {
+            return;
+        }
 
         $code = array_dot($queryParams, 'code');
         $errorReason = array_dot($queryParams, 'error_reason');
 
-        if (!is_null($code) && !$this->hasError()) {
-            $this->getAccessToken($code);
+        if (!is_null($code)) {
+            $this->retrieveAccessToken($code);
+
+            return;
         }
 
         if (!is_null($errorReason) && $errorReason === 'user_denied') {
@@ -169,7 +195,7 @@ class FacebookAuth
         return;
     }
 
-    protected function getAccessToken($code)
+    protected function retrieveAccessToken($code)
     {
         $baseUrl = 'https://graph.facebook.com/'.$this->getGraphApiVersion().'/oauth/access_token';
         $urlParams = [
@@ -179,16 +205,88 @@ class FacebookAuth
             'code' => $code,
         ];
 
+        $response = $this->makeRequest($baseUrl, $urlParams);
+
+        if ($response['http_status_code'] === 200) {
+            $data = json_decode($response['response']);
+
+            $this->setUserAccessToken($data->access_token);
+
+            $this->retrieveUserInformation();
+
+            return;
+        }
+
+        if ($response['http_status_code'] === 400) {
+            //TODO: Log real errors somewhere
+            //400: Bad request: {"error":
+            //{"message":"Invalid verification code format.","type":"OAuthException",
+            //"code":100,"fbtrace_id":"DJLC1FT6NpM"}
+            //}
+            $this->setErrorCode(self::ERROR_OAUTH_EXCEPTION);
+
+            return;
+        }
+
+        $this->setErrorCode(self::ERROR_AUTH_FAILED);
+
+        return;
+    }
+
+    protected function retrieveUserInformation()
+    {
+        $response = $this->makeRequest('https://graph.facebook.com/v2.7/me', [
+            'fields' => 'id,name,email,picture',
+            'access_token' => $this->getUserAccessToken(),
+        ]);
+
+        if ($response['http_status_code'] === 200) {
+            $this->setUser(json_decode($response['response']));
+
+            return;
+        }
+
+        if ($response['http_status_code'] === 400) {
+            //TODO: Log real errors somewhere
+            //400: Bad request: {"error":
+            //{"message":"Invalid verification code format.","type":"OAuthException"
+            //"code":100,"fbtrace_id":"DJLC1FT6NpM"}
+            //}
+            $this->setErrorCode(self::ERROR_OAUTH_EXCEPTION);
+
+            return;
+        }
+
+        $this->setErrorCode(self::ERROR_AUTH_FAILED);
+
+        return;
+    }
+
+    /**
+     * Makes a curl request.
+     *
+     * @param string $baseUrl   The base url
+     * @param array  $urlParams Url params array
+     * @param int    $post      0 for get, 1 for post
+     *
+     * @return array
+     */
+    protected function makeRequest($baseUrl, $urlParams, $post = 0)
+    {
         $request = curl_init();
 
         curl_setopt($request, CURLOPT_RETURNTRANSFER, true);
         curl_setopt($request, CURLOPT_URL, $this->buildUrl($baseUrl, $urlParams));
-        curl_setopt($request, CURLOPT_POST, 0);
+        curl_setopt($request, CURLOPT_POST, $post);
 
         // TODO: DEBUG mode!
         curl_setopt($request, CURLOPT_VERBOSE, true);
 
-        $response = curl_exec($request);
+        $response = array();
+        $response['response'] = curl_exec($request);
+        $response['http_status_code'] = curl_getinfo($request, CURLINFO_HTTP_CODE);
+
+        return $response;
     }
 
     /**
@@ -200,18 +298,10 @@ class FacebookAuth
      */
     protected function checkCsrfToken($token)
     {
-        $sessionToken = null;
-        $sessionExpires = null;
+        $sessionToken = array_dot($_SESSION, 'facebookauth_csrf.token');
+        $sessionExpires = array_dot($_SESSION, 'facebookauth_csrf.expires');
 
-        if (isset($_SESSION['facebookauth_csrf']['token'])) {
-            $sessionToken = $_SESSION['facebookauth_csrf']['token'];
-            unset($_SESSION['facebookauth_csrf']['token']);
-        }
-
-        if (isset($_SESSION['facebookauth_csrf']['expires'])) {
-            $sessionExpires = $_SESSION['facebookauth_csrf']['expires'];
-            unset($_SESSION['facebookauth_csrf']['expires']);
-        }
+        unset($_SESSION['facebookauth_csrf']);
 
         if (is_null($token) || is_null($sessionToken) || is_null($sessionExpires)) {
             $this->setErrorCode(self::ERROR_INVALID_CSRF_TOKEN);
@@ -228,6 +318,14 @@ class FacebookAuth
         return;
     }
 
+    /**
+     * Builds an url.
+     *
+     * @param string $baseUrl
+     * @param array  $urlParams
+     *
+     * @return string
+     */
     protected function buildUrl($baseUrl, $urlParams)
     {
         return $baseUrl.'?'.http_build_query($urlParams);
@@ -417,6 +515,54 @@ class FacebookAuth
     public function setGraphApiVersion($graphApiVersion)
     {
         $this->graphApiVersion = $graphApiVersion;
+
+        return $this;
+    }
+
+    /**
+     * Get the value of Access token to query the user.
+     *
+     * @return string
+     */
+    public function getUserAccessToken()
+    {
+        return $this->userAccessToken;
+    }
+
+    /**
+     * Set the value of Access token to query the user.
+     *
+     * @param string userAccessToken
+     *
+     * @return self
+     */
+    public function setUserAccessToken($userAccessToken)
+    {
+        $this->userAccessToken = $userAccessToken;
+
+        return $this;
+    }
+
+    /**
+     * Get the value of Facebook user object.
+     *
+     * @return stdClass
+     */
+    public function getUser()
+    {
+        return $this->user;
+    }
+
+    /**
+     * Set the value of Facebook user object.
+     *
+     * @param stdClass user
+     *
+     * @return self
+     */
+    public function setUser(stdClass $user)
+    {
+        $this->user = $user;
 
         return $this;
     }
